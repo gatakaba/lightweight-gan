@@ -1,17 +1,17 @@
 import os
-import fire
 import random
+from datetime import datetime
+
+import fire
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from retry.api import retry_call
 from tqdm import tqdm
-from datetime import datetime
-from functools import wraps
-from lightweight_gan import Trainer, NanException
 
-import torch
-import torch.multiprocessing as mp
-import torch.distributed as dist
-
-import numpy as np
+from lightweight_gan.lightweight_gan import NanException
+from lightweight_gan.trainer import Trainer
 
 
 def cast_list(el):
@@ -182,3 +182,7 @@ def train_from_folder(
 
 def main():
     fire.Fire(train_from_folder)
+
+
+if __name__ == "__main__":
+    main()
