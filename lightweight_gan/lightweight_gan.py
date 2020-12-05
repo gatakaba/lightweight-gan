@@ -12,7 +12,7 @@ from shutil import rmtree
 import torch
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim import Adam
-from torch import nn, einsum
+from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.autograd import grad as torch_grad
@@ -38,55 +38,65 @@ from scipy.stats import truncnorm
 
 # asserts
 
-assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
+assert torch.cuda.is_available(), "You need to have an Nvidia GPU with CUDA installed."
 
 # constants
 
 NUM_CORES = multiprocessing.cpu_count()
-EXTS = ['jpg', 'jpeg', 'png']
+EXTS = ["jpg", "jpeg", "png"]
 CALC_FID_NUM_IMAGES = 12800
 
 # helpers
 
+
 def exists(val):
     return val is not None
+
 
 @contextmanager
 def null_context():
     yield
+
 
 def combine_contexts(contexts):
     @contextmanager
     def multi_contexts():
         with ExitStack() as stack:
             yield [stack.enter_context(ctx()) for ctx in contexts]
+
     return multi_contexts
+
 
 def is_power_of_two(val):
     return log2(val).is_integer()
 
+
 def default(val, d):
     return val if exists(val) else d
+
 
 def set_requires_grad(model, bool):
     for p in model.parameters():
         p.requires_grad = bool
+
 
 def cycle(iterable):
     while True:
         for i in iterable:
             yield i
 
+
 def raise_if_nan(t):
     if torch.isnan(t):
         raise NanException
+
 
 def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
     if is_ddp:
         num_no_syncs = gradient_accumulate_every - 1
         head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
         tail = [null_context]
-        contexts =  head + tail
+        contexts = head + tail
     else:
         contexts = [null_context] * gradient_accumulate_every
 
@@ -94,8 +104,10 @@ def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
         with context():
             yield
 
+
 def hinge_loss(real, fake):
     return (F.relu(1 + real) + F.relu(1 - fake)).mean()
+
 
 def evaluate_in_chunks(max_batch_size, model, *args):
     split_args = list(zip(*list(map(lambda x: x.split(max_batch_size, dim=0), args))))
@@ -104,41 +116,52 @@ def evaluate_in_chunks(max_batch_size, model, *args):
         return chunked_outputs[0]
     return torch.cat(chunked_outputs, dim=0)
 
+
 def slerp(val, low, high):
     low_norm = low / torch.norm(low, dim=1, keepdim=True)
     high_norm = high / torch.norm(high, dim=1, keepdim=True)
     omega = torch.acos((low_norm * high_norm).sum(1))
     so = torch.sin(omega)
-    res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+    res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (
+        torch.sin(val * omega) / so
+    ).unsqueeze(1) * high
     return res
 
-def truncated_normal(size, threshold = 1.5):
-    values = truncnorm.rvs(-threshold, threshold, size = size)
+
+def truncated_normal(size, threshold=1.5):
+    values = truncnorm.rvs(-threshold, threshold, size=size)
     return torch.from_numpy(values)
 
+
 # helper classes
+
 
 class NanException(Exception):
     pass
 
-class EMA():
+
+class EMA:
     def __init__(self, beta):
         super().__init__()
         self.beta = beta
+
     def update_average(self, old, new):
         if not exists(old):
             return new
         return old * self.beta + (1 - self.beta) * new
 
+
 class RandomApply(nn.Module):
-    def __init__(self, prob, fn, fn_else = lambda x: x):
+    def __init__(self, prob, fn, fn_else=lambda x: x):
         super().__init__()
         self.fn = fn
         self.fn_else = fn_else
         self.prob = prob
+
     def forward(self, x):
         fn = self.fn if random() < self.prob else self.fn_else
         return fn(x)
+
 
 class Rezero(nn.Module):
     def __init__(self, fn):
@@ -149,6 +172,7 @@ class Rezero(nn.Module):
     def forward(self, x):
         return self.g * self.fn(x)
 
+
 class Residual(nn.Module):
     def __init__(self, fn):
         super().__init__()
@@ -157,29 +181,36 @@ class Residual(nn.Module):
     def forward(self, x):
         return self.fn(x) + x
 
+
 class SumBranches(nn.Module):
     def __init__(self, branches):
         super().__init__()
         self.branches = nn.ModuleList(branches)
+
     def forward(self, x):
         return sum(map(lambda fn: fn(x), self.branches))
+
 
 class Blur(nn.Module):
     def __init__(self):
         super().__init__()
         f = torch.Tensor([1, 2, 1])
-        self.register_buffer('f', f)
+        self.register_buffer("f", f)
+
     def forward(self, x):
         f = self.f
-        f = f[None, None, :] * f [None, :, None]
+        f = f[None, None, :] * f[None, :, None]
         return filter2D(x, f, normalized=True)
 
+
 # dataset
+
 
 def convert_image_to(img_type, image):
     if image.mode != img_type:
         return image.convert(img_type)
     return image
+
 
 class expand_greyscale(object):
     def __init__(self, transparent):
@@ -199,37 +230,47 @@ class expand_greyscale(object):
             color = tensor[:1].expand(3, -1, -1)
             alpha = tensor[1:]
         else:
-            raise Exception(f'image with invalid number of channels given {channels}')
+            raise Exception(f"image with invalid number of channels given {channels}")
 
         if not exists(alpha) and self.transparent:
             alpha = torch.ones(1, *tensor.shape[1:], device=tensor.device)
 
         return color if not self.transparent else torch.cat((color, alpha))
 
+
 def resize_to_minimum_size(min_size, image):
     if max(*image.size) < min_size:
         return torchvision.transforms.functional.resize(image, min_size)
     return image
 
+
 class ImageDataset(Dataset):
-    def __init__(self, folder, image_size, transparent = False, aug_prob = 0.):
+    def __init__(self, folder, image_size, transparent=False, aug_prob=0.0):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
-        self.paths = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-        assert len(self.paths) > 0, f'No images were found in {folder} for training'
+        self.paths = [p for ext in EXTS for p in Path(f"{folder}").glob(f"**/*.{ext}")]
+        assert len(self.paths) > 0, f"No images were found in {folder} for training"
 
-        convert_image_fn = partial(convert_image_to, 'RGBA' if transparent else 'RGB')
+        convert_image_fn = partial(convert_image_to, "RGBA" if transparent else "RGB")
         num_channels = 3 if not transparent else 4
 
-        self.transform = transforms.Compose([
-            transforms.Lambda(convert_image_fn),
-            transforms.Lambda(partial(resize_to_minimum_size, image_size)),
-            transforms.Resize(image_size),
-            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
-            transforms.ToTensor(),
-            transforms.Lambda(expand_greyscale(transparent))
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.Lambda(convert_image_fn),
+                transforms.Lambda(partial(resize_to_minimum_size, image_size)),
+                transforms.Resize(image_size),
+                RandomApply(
+                    aug_prob,
+                    transforms.RandomResizedCrop(
+                        image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)
+                    ),
+                    transforms.CenterCrop(image_size),
+                ),
+                transforms.ToTensor(),
+                transforms.Lambda(expand_greyscale(transparent)),
+            ]
+        )
 
     def __len__(self):
         return len(self.paths)
@@ -239,19 +280,22 @@ class ImageDataset(Dataset):
         img = Image.open(path)
         return self.transform(img)
 
+
 # augmentations
+
 
 def random_hflip(tensor, prob):
     if prob > random():
         return tensor
     return torch.flip(tensor, dims=(3,))
 
+
 class AugWrapper(nn.Module):
     def __init__(self, D, image_size):
         super().__init__()
         self.D = D
 
-    def forward(self, images, prob = 0., types = [], detach = False, **kwargs):
+    def forward(self, images, prob=0.0, types=[], detach=False, **kwargs):
         if random() < prob:
             images = random_hflip(images, prob=0.5)
             images = DiffAugment(images, types=types)
@@ -261,22 +305,21 @@ class AugWrapper(nn.Module):
 
         return self.D(images, **kwargs)
 
+
 # modifiable global variables
 
 norm_class = nn.BatchNorm2d
 
-def upsample(scale_factor = 2):
-    return nn.Upsample(scale_factor = scale_factor)
+
+def upsample(scale_factor=2):
+    return nn.Upsample(scale_factor=scale_factor)
+
 
 # classes
 
+
 class SLE(nn.Module):
-    def __init__(
-        self,
-        *,
-        chan_in,
-        chan_out
-    ):
+    def __init__(self, *, chan_in, chan_out):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d((4, 4))
         self.max_pool = nn.AdaptiveMaxPool2d((4, 4))
@@ -286,66 +329,72 @@ class SLE(nn.Module):
             nn.Conv2d(chan_in * 2, chan_intermediate, 4),
             nn.LeakyReLU(0.1),
             nn.Conv2d(chan_intermediate, chan_out, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
+
     def forward(self, x):
         pooled_avg = self.avg_pool(x)
         pooled_max = self.max_pool(x)
-        return self.net(torch.cat((pooled_max, pooled_avg), dim = 1))
+        return self.net(torch.cat((pooled_max, pooled_avg), dim=1))
+
 
 class SpatialSLE(nn.Module):
-    def __init__(self, upsample_times, num_groups = 2):
+    def __init__(self, upsample_times, num_groups=2):
         super().__init__()
         self.num_groups = num_groups
         chan = num_groups * 2
 
         self.net = nn.Sequential(
-            nn.Conv2d(chan, chan, 3, padding = 1),
+            nn.Conv2d(chan, chan, 3, padding=1),
             upsample(2 ** upsample_times),
-            nn.Conv2d(chan, chan, 3, padding = 1),
+            nn.Conv2d(chan, chan, 3, padding=1),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(chan, 1, 3, padding = 1),
-            nn.Sigmoid()
+            nn.Conv2d(chan, 1, 3, padding=1),
+            nn.Sigmoid(),
         )
+
     def forward(self, x):
         b, c, h, w = x.shape
         num_groups = self.num_groups
         mult = math.ceil(c / num_groups)
         padding = (mult - c % mult) // 2
         x_padded = F.pad(x, (0, 0, 0, 0, padding, padding))
-        x = rearrange(x_padded, 'b (g c) h w -> b g c h w', g = num_groups)
+        x = rearrange(x_padded, "b (g c) h w -> b g c h w", g=num_groups)
 
-        pooled_avg = x.mean(dim = 2)
-        pooled_max, _ = x.max(dim = 2)
-        pooled = torch.cat((pooled_avg, pooled_max), dim = 1)
+        pooled_avg = x.mean(dim=2)
+        pooled_max, _ = x.max(dim=2)
+        pooled = torch.cat((pooled_avg, pooled_max), dim=1)
         return self.net(pooled)
+
 
 class Generator(nn.Module):
     def __init__(
         self,
         *,
         image_size,
-        latent_dim = 256,
-        fmap_max = 512,
-        fmap_inverse_coef = 12,
-        transparent = False,
-        attn_res_layers = [],
-        sle_spatial = False
+        latent_dim=256,
+        fmap_max=512,
+        fmap_inverse_coef=12,
+        transparent=False,
+        attn_res_layers=[],
+        sle_spatial=False,
     ):
         super().__init__()
         resolution = log2(image_size)
-        assert is_power_of_two(image_size), 'image size must be a power of 2'
+        assert is_power_of_two(image_size), "image size must be a power of 2"
         init_channel = 4 if transparent else 3
         fmap_max = default(fmap_max, latent_dim)
 
         self.initial_conv = nn.Sequential(
             nn.ConvTranspose2d(latent_dim, latent_dim * 2, 4),
             norm_class(latent_dim * 2),
-            nn.GLU(dim = 1)
+            nn.GLU(dim=1),
         )
 
         num_layers = int(resolution) - 2
-        features = list(map(lambda n: (n,  2 ** (fmap_inverse_coef - n)), range(2, num_layers + 2)))
+        features = list(
+            map(lambda n: (n, 2 ** (fmap_inverse_coef - n)), range(2, num_layers + 2))
+        )
         features = list(map(lambda n: (n[0], min(n[1], fmap_max)), features))
         features = list(map(lambda n: 3 if n[0] >= 8 else n[1], features))
         features = [latent_dim, *features]
@@ -357,7 +406,9 @@ class Generator(nn.Module):
         self.res_to_feature_map = dict(zip(self.res_layers, in_out_features))
 
         self.sle_map = ((3, 7), (4, 8), (5, 9), (6, 10))
-        self.sle_map = list(filter(lambda t: t[0] <= resolution and t[1] <= resolution, self.sle_map))
+        self.sle_map = list(
+            filter(lambda t: t[0] <= resolution and t[1] <= resolution, self.sle_map)
+        )
         self.sle_map = dict(self.sle_map)
 
         self.num_layers_spatial_res = 1
@@ -367,45 +418,44 @@ class Generator(nn.Module):
 
             attn = None
             if image_width in attn_res_layers:
-                attn = Rezero(GSA(dim = chan_in, norm_queries = True))
+                attn = Rezero(GSA(dim=chan_in, norm_queries=True))
 
             sle = None
             if res in self.sle_map:
                 residual_layer = self.sle_map[res]
                 sle_chan_out = self.res_to_feature_map[residual_layer - 1][-1]
 
-                sle = SLE(
-                    chan_in = chan_out,
-                    chan_out = sle_chan_out
-                )
+                sle = SLE(chan_in=chan_out, chan_out=sle_chan_out)
 
             sle_spatial = None
             if res <= (resolution - self.num_layers_spatial_res):
                 sle_spatial = SpatialSLE(
-                    upsample_times = self.num_layers_spatial_res,
-                    num_groups = 2 if res < 8 else 1
+                    upsample_times=self.num_layers_spatial_res,
+                    num_groups=2 if res < 8 else 1,
                 )
 
-            layer = nn.ModuleList([
-                nn.Sequential(
-                    upsample(),
-                    Blur(),
-                    nn.Conv2d(chan_in, chan_out * 2, 3, padding = 1),
-                    norm_class(chan_out * 2),
-                    nn.GLU(dim = 1)
-                ),
-                sle,
-                sle_spatial,
-                attn
-            ])
+            layer = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        upsample(),
+                        Blur(),
+                        nn.Conv2d(chan_in, chan_out * 2, 3, padding=1),
+                        norm_class(chan_out * 2),
+                        nn.GLU(dim=1),
+                    ),
+                    sle,
+                    sle_spatial,
+                    attn,
+                ]
+            )
             self.layers.append(layer)
 
-        self.out_conv = nn.Conv2d(features[-1], init_channel, 3, padding = 1)
+        self.out_conv = nn.Conv2d(features[-1], init_channel, 3, padding=1)
 
     def forward(self, x):
-        x = rearrange(x, 'b c -> b c () ()')
+        x = rearrange(x, "b c -> b c () ()")
         x = self.initial_conv(x)
-        x = F.normalize(x, dim = -1)
+        x = F.normalize(x, dim=-1)
 
         residuals = dict()
         spatial_residuals = dict()
@@ -434,13 +484,10 @@ class Generator(nn.Module):
 
         return self.out_conv(x)
 
+
 class SimpleDecoder(nn.Module):
     def __init__(
-        self,
-        *,
-        chan_in,
-        chan_out = 3,
-        num_upsamples = 4,
+        self, *, chan_in, chan_out=3, num_upsamples=4,
     ):
         super().__init__()
 
@@ -452,9 +499,7 @@ class SimpleDecoder(nn.Module):
             last_layer = ind == (num_upsamples - 1)
             chan_out = chans if not last_layer else final_chan * 2
             layer = nn.Sequential(
-                upsample(),
-                nn.Conv2d(chans, chan_out, 3, padding = 1),
-                nn.GLU(dim = 1)
+                upsample(), nn.Conv2d(chans, chan_out, 3, padding=1), nn.GLU(dim=1)
             )
             self.layers.append(layer)
             chans //= 2
@@ -464,21 +509,25 @@ class SimpleDecoder(nn.Module):
             x = layer(x)
         return x
 
+
 class Discriminator(nn.Module):
     def __init__(
         self,
         *,
         image_size,
-        fmap_max = 512,
-        fmap_inverse_coef = 12,
-        transparent = False,
-        disc_output_size = 5,
-        attn_res_layers = []
+        fmap_max=512,
+        fmap_inverse_coef=12,
+        transparent=False,
+        disc_output_size=5,
+        attn_res_layers=[],
     ):
         super().__init__()
         resolution = log2(image_size)
-        assert is_power_of_two(image_size), 'image size must be a power of 2'
-        assert disc_output_size in {1, 5}, 'discriminator output dimensions can only be 5x5 or 1x1'
+        assert is_power_of_two(image_size), "image size must be a power of 2"
+        assert disc_output_size in {
+            1,
+            5,
+        }, "discriminator output dimensions can only be 5x5 or 1x1"
 
         resolution = int(resolution)
         init_channel = 4 if transparent else 3
@@ -487,7 +536,9 @@ class Discriminator(nn.Module):
         num_residual_layers = 8 - 3
 
         non_residual_resolutions = range(min(8, resolution), 2, -1)
-        features = list(map(lambda n: (n,  2 ** (fmap_inverse_coef - n)), non_residual_resolutions))
+        features = list(
+            map(lambda n: (n, 2 ** (fmap_inverse_coef - n)), non_residual_resolutions)
+        )
         features = list(map(lambda n: (n[0], min(n[1], fmap_max)), features))
 
         if num_non_residual_layers == 0:
@@ -502,82 +553,100 @@ class Discriminator(nn.Module):
             last_layer = ind == (num_non_residual_layers - 1)
             chan_out = features[0][-1] if last_layer else init_channel
 
-            self.non_residual_layers.append(nn.Sequential(
-                Blur(),
-                nn.Conv2d(init_channel, chan_out, 4, stride = 2, padding = 1),
-                nn.LeakyReLU(0.1)
-            ))
+            self.non_residual_layers.append(
+                nn.Sequential(
+                    Blur(),
+                    nn.Conv2d(init_channel, chan_out, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.1),
+                )
+            )
 
         self.residual_layers = nn.ModuleList([])
 
-        for (res, ((_, chan_in), (_, chan_out))) in zip(non_residual_resolutions, chan_in_out):
+        for (res, ((_, chan_in), (_, chan_out))) in zip(
+            non_residual_resolutions, chan_in_out
+        ):
             image_width = 2 ** resolution
 
             attn = None
             if image_width in attn_res_layers:
-                attn = Rezero(GSA(dim = chan_in, batch_norm = False, norm_queries = True))
+                attn = Rezero(GSA(dim=chan_in, batch_norm=False, norm_queries=True))
 
-            self.residual_layers.append(nn.ModuleList([
-                SumBranches([
-                    nn.Sequential(
-                        Blur(),
-                        nn.Conv2d(chan_in, chan_out, 4, stride = 2, padding = 1),
-                        nn.LeakyReLU(0.1),
-                        nn.Conv2d(chan_out, chan_out, 3, padding = 1),
-                        nn.LeakyReLU(0.1)
-                    ),
-                    nn.Sequential(
-                        Blur(),
-                        nn.AvgPool2d(2),
-                        nn.Conv2d(chan_in, chan_out, 1),
-                        nn.LeakyReLU(0.1),
-                    )
-                ]),
-                attn
-            ]))
+            self.residual_layers.append(
+                nn.ModuleList(
+                    [
+                        SumBranches(
+                            [
+                                nn.Sequential(
+                                    Blur(),
+                                    nn.Conv2d(
+                                        chan_in, chan_out, 4, stride=2, padding=1
+                                    ),
+                                    nn.LeakyReLU(0.1),
+                                    nn.Conv2d(chan_out, chan_out, 3, padding=1),
+                                    nn.LeakyReLU(0.1),
+                                ),
+                                nn.Sequential(
+                                    Blur(),
+                                    nn.AvgPool2d(2),
+                                    nn.Conv2d(chan_in, chan_out, 1),
+                                    nn.LeakyReLU(0.1),
+                                ),
+                            ]
+                        ),
+                        attn,
+                    ]
+                )
+            )
 
         last_chan = features[-1][-1]
         if disc_output_size == 5:
             self.to_logits = nn.Sequential(
                 nn.Conv2d(last_chan, last_chan, 1),
                 nn.LeakyReLU(0.1),
-                nn.Conv2d(last_chan, 1, 4)
+                nn.Conv2d(last_chan, 1, 4),
             )
         elif disc_output_size == 1:
             self.to_logits = nn.Sequential(
                 Blur(),
-                nn.Conv2d(last_chan, last_chan, 3, stride = 2, padding = 1),
+                nn.Conv2d(last_chan, last_chan, 3, stride=2, padding=1),
                 nn.LeakyReLU(0.1),
-                nn.Conv2d(last_chan, 1, 4)
+                nn.Conv2d(last_chan, 1, 4),
             )
 
         self.to_shape_disc_out = nn.Sequential(
-            nn.Conv2d(init_channel, 64, 3, padding = 1),
-            Residual(Rezero(GSA(dim = 64, norm_queries = True, batch_norm = False))),
-            SumBranches([
-                nn.Sequential(
-                    Blur(),
-                    nn.Conv2d(64, 32, 4, stride = 2, padding = 1),
-                    nn.LeakyReLU(0.1),
-                    nn.Conv2d(32, 32, 3, padding = 1),
-                    nn.LeakyReLU(0.1)
-                ),
-                nn.Sequential(
-                    Blur(),
-                    nn.AvgPool2d(2),
-                    nn.Conv2d(64, 32, 1),
-                    nn.LeakyReLU(0.1),
-                )
-            ]),
-            Residual(Rezero(GSA(dim = 32, norm_queries = True, batch_norm = False))),
+            nn.Conv2d(init_channel, 64, 3, padding=1),
+            Residual(Rezero(GSA(dim=64, norm_queries=True, batch_norm=False))),
+            SumBranches(
+                [
+                    nn.Sequential(
+                        Blur(),
+                        nn.Conv2d(64, 32, 4, stride=2, padding=1),
+                        nn.LeakyReLU(0.1),
+                        nn.Conv2d(32, 32, 3, padding=1),
+                        nn.LeakyReLU(0.1),
+                    ),
+                    nn.Sequential(
+                        Blur(),
+                        nn.AvgPool2d(2),
+                        nn.Conv2d(64, 32, 1),
+                        nn.LeakyReLU(0.1),
+                    ),
+                ]
+            ),
+            Residual(Rezero(GSA(dim=32, norm_queries=True, batch_norm=False))),
             nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Conv2d(32, 1, 4)
+            nn.Conv2d(32, 1, 4),
         )
 
-        self.decoder1 = SimpleDecoder(chan_in = last_chan, chan_out = init_channel)
-        self.decoder2 = SimpleDecoder(chan_in = features[-2][-1], chan_out = init_channel) if resolution >= 9 else None
+        self.decoder1 = SimpleDecoder(chan_in=last_chan, chan_out=init_channel)
+        self.decoder2 = (
+            SimpleDecoder(chan_in=features[-2][-1], chan_out=init_channel)
+            if resolution >= 9
+            else None
+        )
 
-    def forward(self, x, calc_aux_loss = False):
+    def forward(self, x, calc_aux_loss=False):
         orig_img = x
 
         for layer in self.non_residual_layers:
@@ -594,7 +663,7 @@ class Discriminator(nn.Module):
 
         out = self.to_logits(x).flatten(1)
 
-        img_32x32 = F.interpolate(orig_img, size = (32, 32))
+        img_32x32 = F.interpolate(orig_img, size=(32, 32))
         out_32x32 = self.to_shape_disc_out(img_32x32)
 
         if not calc_aux_loss:
@@ -608,25 +677,26 @@ class Discriminator(nn.Module):
         recon_img_8x8 = self.decoder1(layer_8x8)
 
         aux_loss = F.mse_loss(
-            recon_img_8x8,
-            F.interpolate(orig_img, size = recon_img_8x8.shape[2:])
+            recon_img_8x8, F.interpolate(orig_img, size=recon_img_8x8.shape[2:])
         )
 
         if exists(self.decoder2):
-            select_random_quadrant = lambda rand_quadrant, img: rearrange(img, 'b c (m h) (n w) -> (m n) b c h w', m = 2, n = 2)[rand_quadrant]
+            select_random_quadrant = lambda rand_quadrant, img: rearrange(
+                img, "b c (m h) (n w) -> (m n) b c h w", m=2, n=2
+            )[rand_quadrant]
             crop_image_fn = partial(select_random_quadrant, floor(random() * 4))
             img_part, layer_16x16_part = map(crop_image_fn, (orig_img, layer_16x16))
 
             recon_img_16x16 = self.decoder2(layer_16x16_part)
 
             aux_loss_16x16 = F.mse_loss(
-                recon_img_16x16,
-                F.interpolate(img_part, size = recon_img_16x16.shape[2:])
+                recon_img_16x16, F.interpolate(img_part, size=recon_img_16x16.shape[2:])
             )
 
             aux_loss = aux_loss + aux_loss_16x16
 
         return out, out_32x32, aux_loss
+
 
 class LightweightGAN(nn.Module):
     def __init__(
@@ -634,54 +704,55 @@ class LightweightGAN(nn.Module):
         *,
         latent_dim,
         image_size,
-        optimizer = "adam",
-        fmap_max = 512,
-        fmap_inverse_coef = 12,
-        transparent = False,
-        disc_output_size = 5,
-        attn_res_layers = [],
-        sle_spatial = False,
-        ttur_mult = 1.,
-        lr = 2e-4,
-        rank = 0,
-        ddp = False
+        optimizer="adam",
+        fmap_max=512,
+        fmap_inverse_coef=12,
+        transparent=False,
+        disc_output_size=5,
+        attn_res_layers=[],
+        sle_spatial=False,
+        ttur_mult=1.0,
+        lr=2e-4,
+        rank=0,
+        ddp=False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.image_size = image_size
 
         G_kwargs = dict(
-            image_size = image_size,
-            latent_dim = latent_dim,
-            fmap_max = fmap_max,
-            fmap_inverse_coef = fmap_inverse_coef,
-            transparent = transparent,
-            attn_res_layers = attn_res_layers,
-            sle_spatial = sle_spatial
+            image_size=image_size,
+            latent_dim=latent_dim,
+            fmap_max=fmap_max,
+            fmap_inverse_coef=fmap_inverse_coef,
+            transparent=transparent,
+            attn_res_layers=attn_res_layers,
+            sle_spatial=sle_spatial,
         )
 
         self.G = Generator(**G_kwargs)
 
         self.D = Discriminator(
-            image_size = image_size,
-            fmap_max = fmap_max,
-            fmap_inverse_coef = fmap_inverse_coef,
-            transparent = transparent,
-            attn_res_layers = attn_res_layers,
-            disc_output_size = disc_output_size
+            image_size=image_size,
+            fmap_max=fmap_max,
+            fmap_inverse_coef=fmap_inverse_coef,
+            transparent=transparent,
+            attn_res_layers=attn_res_layers,
+            disc_output_size=disc_output_size,
         )
 
         self.ema_updater = EMA(0.995)
         self.GE = Generator(**G_kwargs)
         set_requires_grad(self.GE, False)
 
-
         if optimizer == "adam":
-            self.G_opt = Adam(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
-            self.D_opt = Adam(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
+            self.G_opt = Adam(self.G.parameters(), lr=lr, betas=(0.5, 0.9))
+            self.D_opt = Adam(self.D.parameters(), lr=lr * ttur_mult, betas=(0.5, 0.9))
         elif optimizer == "adabelief":
-            self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
-            self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
+            self.G_opt = AdaBelief(self.G.parameters(), lr=lr, betas=(0.5, 0.9))
+            self.D_opt = AdaBelief(
+                self.D.parameters(), lr=lr * ttur_mult, betas=(0.5, 0.9)
+            )
         else:
             assert False, "No valid optimizer is given"
 
@@ -693,16 +764,24 @@ class LightweightGAN(nn.Module):
 
     def _init_weights(self, m):
         if type(m) in {nn.Conv2d, nn.Linear}:
-            nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+            nn.init.kaiming_normal_(
+                m.weight, a=0, mode="fan_in", nonlinearity="leaky_relu"
+            )
 
     def EMA(self):
         def update_moving_average(ma_model, current_model):
-            for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            for current_params, ma_params in zip(
+                current_model.parameters(), ma_model.parameters()
+            ):
                 old_weight, up_weight = ma_params.data, current_params.data
                 ma_params.data = self.ema_updater.update_average(old_weight, up_weight)
 
-            for current_buffer, ma_buffer in zip(current_model.buffers(), ma_model.buffers()):
-                new_buffer_value = self.ema_updater.update_average(ma_buffer, current_buffer)
+            for current_buffer, ma_buffer in zip(
+                current_model.buffers(), ma_model.buffers()
+            ):
+                new_buffer_value = self.ema_updater.update_average(
+                    ma_buffer, current_buffer
+                )
                 ma_buffer.copy_(new_buffer_value)
 
         update_moving_average(self.GE, self.G)
@@ -713,44 +792,46 @@ class LightweightGAN(nn.Module):
     def forward(self, x):
         raise NotImplemented
 
+
 # trainer
 
-class Trainer():
+
+class Trainer:
     def __init__(
         self,
-        name = 'default',
-        results_dir = 'results',
-        models_dir = 'models',
-        base_dir = './',
+        name="default",
+        results_dir="results",
+        models_dir="models",
+        base_dir="./",
         optimizer="adam",
-        latent_dim = 256,
-        image_size = 128,
-        fmap_max = 512,
-        transparent = False,
-        batch_size = 4,
-        gp_weight = 10,
-        gradient_accumulate_every = 1,
-        attn_res_layers = [],
-        sle_spatial = False,
-        disc_output_size = 5,
-        antialias = False,
-        lr = 2e-4,
-        lr_mlp = 1.,
-        ttur_mult = 1.,
-        save_every = 1000,
-        evaluate_every = 1000,
-        trunc_psi = 0.6,
-        aug_prob = None,
-        aug_types = ['translation', 'cutout'],
-        dataset_aug_prob = 0.,
-        calculate_fid_every = None,
-        is_ddp = False,
-        rank = 0,
-        world_size = 1,
-        log = False,
-        amp = False,
+        latent_dim=256,
+        image_size=128,
+        fmap_max=512,
+        transparent=False,
+        batch_size=4,
+        gp_weight=10,
+        gradient_accumulate_every=1,
+        attn_res_layers=[],
+        sle_spatial=False,
+        disc_output_size=5,
+        antialias=False,
+        lr=2e-4,
+        lr_mlp=1.0,
+        ttur_mult=1.0,
+        save_every=1000,
+        evaluate_every=1000,
+        trunc_psi=0.6,
+        aug_prob=None,
+        aug_types=["translation", "cutout"],
+        dataset_aug_prob=0.0,
+        calculate_fid_every=None,
+        is_ddp=False,
+        rank=0,
+        world_size=1,
+        log=False,
+        amp=False,
         *args,
-        **kwargs
+        **kwargs,
     ):
         self.GAN_params = [args, kwargs]
         self.GAN = None
@@ -761,10 +842,14 @@ class Trainer():
         self.base_dir = base_dir
         self.results_dir = base_dir / results_dir
         self.models_dir = base_dir / models_dir
-        self.config_path = self.models_dir / name / '.config.json'
+        self.config_path = self.models_dir / name / ".config.json"
 
-        assert is_power_of_two(image_size), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
-        assert all(map(is_power_of_two, attn_res_layers)), 'resolution layers of attention must all be powers of 2 (16, 32, 64, 128, 256, 512)'
+        assert is_power_of_two(
+            image_size
+        ), "image size must be a power of 2 (64, 128, 256, 512, 1024)"
+        assert all(
+            map(is_power_of_two, attn_res_layers)
+        ), "resolution layers of attention must all be powers of 2 (16, 32, 64, 128, 256, 512)"
 
         self.optimizer = optimizer
         self.latent_dim = latent_dim
@@ -823,12 +908,12 @@ class Trainer():
 
     @property
     def image_extension(self):
-        return 'jpg' if not self.transparent else 'png'
+        return "jpg" if not self.transparent else "png"
 
     @property
     def checkpoint_num(self):
         return floor(self.steps // self.save_every)
-        
+
     def init_GAN(self):
         args, kwargs = self.GAN_params
 
@@ -845,30 +930,35 @@ class Trainer():
 
         if self.syncbatchnorm and not self.is_ddp:
             import torch.distributed as dist
-            os.environ['MASTER_ADDR'] = 'localhost'
-            os.environ['MASTER_PORT'] = '12355'
-            dist.init_process_group('nccl', rank=0, world_size=1)
+
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "12355"
+            dist.init_process_group("nccl", rank=0, world_size=1)
 
         # instantiate GAN
 
         self.GAN = LightweightGAN(
             optimizer=self.optimizer,
-            lr = self.lr,
-            latent_dim = self.latent_dim,
-            attn_res_layers = self.attn_res_layers,
-            sle_spatial = self.sle_spatial,
-            image_size = self.image_size,
-            ttur_mult = self.ttur_mult,
-            fmap_max = self.fmap_max,
-            disc_output_size = self.disc_output_size,
-            transparent = self.transparent,
-            rank = self.rank,
+            lr=self.lr,
+            latent_dim=self.latent_dim,
+            attn_res_layers=self.attn_res_layers,
+            sle_spatial=self.sle_spatial,
+            image_size=self.image_size,
+            ttur_mult=self.ttur_mult,
+            fmap_max=self.fmap_max,
+            disc_output_size=self.disc_output_size,
+            transparent=self.transparent,
+            rank=self.rank,
             *args,
-            **kwargs
+            **kwargs,
         )
 
         if self.is_ddp:
-            ddp_kwargs = {'device_ids': [self.rank], 'output_device': self.rank, 'find_unused_parameters': True}
+            ddp_kwargs = {
+                "device_ids": [self.rank],
+                "output_device": self.rank,
+                "find_unused_parameters": True,
+            }
 
             self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
             self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
@@ -878,44 +968,71 @@ class Trainer():
         self.config_path.write_text(json.dumps(self.config()))
 
     def load_config(self):
-        config = self.config() if not self.config_path.exists() else json.loads(self.config_path.read_text())
-        self.image_size = config['image_size']
-        self.transparent = config['transparent']
-        self.syncbatchnorm = config['syncbatchnorm']
-        self.disc_output_size = config['disc_output_size']
-        self.attn_res_layers = config.pop('attn_res_layers', [])
-        self.sle_spatial = config.pop('sle_spatial', False)
-        self.optimizer = config.pop('optimizer', 'adam')
-        self.fmap_max = config.pop('fmap_max', 512)
+        config = (
+            self.config()
+            if not self.config_path.exists()
+            else json.loads(self.config_path.read_text())
+        )
+        self.image_size = config["image_size"]
+        self.transparent = config["transparent"]
+        self.syncbatchnorm = config["syncbatchnorm"]
+        self.disc_output_size = config["disc_output_size"]
+        self.attn_res_layers = config.pop("attn_res_layers", [])
+        self.sle_spatial = config.pop("sle_spatial", False)
+        self.optimizer = config.pop("optimizer", "adam")
+        self.fmap_max = config.pop("fmap_max", 512)
         del self.GAN
         self.init_GAN()
 
     def config(self):
         return {
-            'image_size': self.image_size,
-            'transparent': self.transparent,
-            'syncbatchnorm': self.syncbatchnorm,
-            'disc_output_size': self.disc_output_size,
-            'optimizer': self.optimizer,
-            'attn_res_layers': self.attn_res_layers,
-            'sle_spatial': self.sle_spatial
+            "image_size": self.image_size,
+            "transparent": self.transparent,
+            "syncbatchnorm": self.syncbatchnorm,
+            "disc_output_size": self.disc_output_size,
+            "optimizer": self.optimizer,
+            "attn_res_layers": self.attn_res_layers,
+            "sle_spatial": self.sle_spatial,
         }
 
     def set_data_src(self, folder):
-        self.dataset = ImageDataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
-        sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        dataloader = DataLoader(self.dataset, num_workers = math.ceil(NUM_CORES / self.world_size), batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        self.dataset = ImageDataset(
+            folder,
+            self.image_size,
+            transparent=self.transparent,
+            aug_prob=self.dataset_aug_prob,
+        )
+        sampler = (
+            DistributedSampler(
+                self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True
+            )
+            if self.is_ddp
+            else None
+        )
+        dataloader = DataLoader(
+            self.dataset,
+            num_workers=math.ceil(NUM_CORES / self.world_size),
+            batch_size=math.ceil(self.batch_size / self.world_size),
+            sampler=sampler,
+            shuffle=not self.is_ddp,
+            drop_last=True,
+            pin_memory=True,
+        )
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
         num_samples = len(self.dataset)
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
-            print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
+            print(
+                f"autosetting augmentation probability to {round(self.aug_prob * 100)}%"
+            )
 
     def train(self):
-        assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
-        device = torch.device(f'cuda:{self.rank}')
+        assert exists(
+            self.loader
+        ), "You must first initialize the data source with `.set_data_src(<folder of images>)`"
+        device = torch.device(f"cuda:{self.rank}")
 
         if not exists(self.GAN):
             self.init_GAN()
@@ -929,9 +1046,9 @@ class Trainer():
         image_size = self.GAN.image_size
         latent_dim = self.GAN.latent_dim
 
-        aug_prob   = default(self.aug_prob, 0)
-        aug_types  = self.aug_types
-        aug_kwargs = {'prob': aug_prob, 'types': aug_types}
+        aug_prob = default(self.aug_prob, 0)
+        aug_types = self.aug_types
+        aug_kwargs = {"prob": aug_prob, "types": aug_types}
 
         G = self.GAN.G if not self.is_ddp else self.G_ddp
         D = self.GAN.D if not self.is_ddp else self.D_ddp
@@ -960,16 +1077,22 @@ class Trainer():
 
         # train discriminator
         self.GAN.D_opt.zero_grad()
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]):
+        for i in gradient_accumulate_contexts(
+            self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]
+        ):
             latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
             image_batch = next(self.loader).cuda(self.rank)
             image_batch.requires_grad_()
 
             with amp_context():
                 generated_images = G(latents)
-                fake_output, fake_output_32x32, _ = D_aug(generated_images.detach(), detach = True, **aug_kwargs)
+                fake_output, fake_output_32x32, _ = D_aug(
+                    generated_images.detach(), detach=True, **aug_kwargs
+                )
 
-                real_output, real_output_32x32, real_aux_loss = D_aug(image_batch,  calc_aux_loss = True, **aug_kwargs)
+                real_output, real_output_32x32, real_aux_loss = D_aug(
+                    image_batch, calc_aux_loss=True, **aug_kwargs
+                )
 
                 real_output_loss = real_output
                 fake_output_loss = fake_output
@@ -983,18 +1106,30 @@ class Trainer():
 
             if apply_gradient_penalty:
                 outputs = [real_output, real_output_32x32]
-                outputs = list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
+                outputs = (
+                    list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
+                )
 
-                scaled_gradients = torch_grad(outputs=outputs, inputs=image_batch,
-                                       grad_outputs=list(map(lambda t: torch.ones(t.size(), device = image_batch.device), outputs)),
-                                       create_graph=True, retain_graph=True, only_inputs=True)[0]
+                scaled_gradients = torch_grad(
+                    outputs=outputs,
+                    inputs=image_batch,
+                    grad_outputs=list(
+                        map(
+                            lambda t: torch.ones(t.size(), device=image_batch.device),
+                            outputs,
+                        )
+                    ),
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
 
-                inv_scale = (1. / self.D_scaler.get_scale()) if self.amp else 1.
+                inv_scale = (1.0 / self.D_scaler.get_scale()) if self.amp else 1.0
                 gradients = scaled_gradients * inv_scale
 
                 with amp_context():
                     gradients = gradients.reshape(batch_size, -1)
-                    gp =  self.gp_weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+                    gp = self.gp_weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
                     if not torch.isnan(gp):
                         disc_loss = disc_loss + gp
@@ -1015,16 +1150,26 @@ class Trainer():
 
         self.GAN.G_opt.zero_grad()
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
+        for i in gradient_accumulate_contexts(
+            self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]
+        ):
             latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
 
             with amp_context():
                 generated_images = G(latents)
-                fake_output, fake_output_32x32, _ = D_aug(generated_images, **aug_kwargs)
-                fake_output_loss = fake_output.mean(dim = 1) + fake_output_32x32.mean(dim = 1)
+                fake_output, fake_output_32x32, _ = D_aug(
+                    generated_images, **aug_kwargs
+                )
+                fake_output_loss = fake_output.mean(dim=1) + fake_output_32x32.mean(
+                    dim=1
+                )
 
-                epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
-                k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
+                epochs = (
+                    self.steps * batch_size * self.gradient_accumulate_every
+                ) / len(self.dataset)
+                k_frac = max(
+                    self.generator_top_k_gamma ** epochs, self.generator_top_k_frac
+                )
                 k = math.ceil(batch_size * k_frac)
 
                 if k != batch_size:
@@ -1036,7 +1181,7 @@ class Trainer():
                 gen_loss = gen_loss / self.gradient_accumulate_every
             gen_loss.register_hook(raise_if_nan)
             backward(gen_loss, self.G_scaler)
-            total_gen_loss += loss 
+            total_gen_loss += loss
 
         self.g_loss = float(total_gen_loss.item() / self.gradient_accumulate_every)
         optimizer_step(self.GAN.G_opt, self.G_scaler)
@@ -1052,7 +1197,9 @@ class Trainer():
         # save from NaN errors
 
         if any(torch.isnan(l) for l in (total_gen_loss, total_disc_loss)):
-            print(f'NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}')
+            print(
+                f"NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}"
+            )
             self.load(self.checkpoint_num)
             raise NanException
 
@@ -1065,26 +1212,34 @@ class Trainer():
             if self.steps % self.save_every == 0:
                 self.save(self.checkpoint_num)
 
-            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 20000):
+            if self.steps % self.evaluate_every == 0 or (
+                self.steps % 100 == 0 and self.steps < 20000
+            ):
                 self.evaluate(floor(self.steps / self.evaluate_every))
 
-            if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
+            if (
+                exists(self.calculate_fid_every)
+                and self.steps % self.calculate_fid_every == 0
+                and self.steps != 0
+            ):
                 num_batches = math.ceil(CALC_FID_NUM_IMAGES / self.batch_size)
                 fid = self.calculate_fid(num_batches)
                 self.last_fid = fid
 
-                with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
-                    f.write(f'{self.steps},{fid}\n')
+                with open(
+                    str(self.results_dir / self.name / f"fid_scores.txt"), "a"
+                ) as f:
+                    f.write(f"{self.steps},{fid}\n")
 
         self.steps += 1
 
     @torch.no_grad()
-    def evaluate(self, num = 0, num_image_tiles = 8, trunc = 1.0):
+    def evaluate(self, num=0, num_image_tiles=8, trunc=1.0):
         self.GAN.eval()
 
         ext = self.image_extension
         num_rows = num_image_tiles
-    
+
         latent_dim = self.GAN.latent_dim
         image_size = self.GAN.image_size
 
@@ -1095,19 +1250,27 @@ class Trainer():
         # regular
 
         generated_images = self.generate_truncated(self.GAN.G, latents)
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
-        
+        torchvision.utils.save_image(
+            generated_images,
+            str(self.results_dir / self.name / f"{str(num)}.{ext}"),
+            nrow=num_rows,
+        )
+
         # moving averages
 
         generated_images = self.generate_truncated(self.GAN.GE, latents)
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
+        torchvision.utils.save_image(
+            generated_images,
+            str(self.results_dir / self.name / f"{str(num)}-ema.{ext}"),
+            nrow=num_rows,
+        )
 
     @torch.no_grad()
     def calculate_fid(self, num_batches):
         torch.cuda.empty_cache()
 
-        real_path = str(self.results_dir / self.name / 'fid_real') + '/'
-        fake_path = str(self.results_dir / self.name / 'fid_fake') + '/'
+        real_path = str(self.results_dir / self.name / "fid_real") + "/"
+        fake_path = str(self.results_dir / self.name / "fid_fake") + "/"
 
         # remove any existing files used for fid calculation and recreate directories
         rmtree(real_path, ignore_errors=True)
@@ -1115,10 +1278,15 @@ class Trainer():
         os.makedirs(real_path)
         os.makedirs(fake_path)
 
-        for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
+        for batch_num in tqdm(
+            range(num_batches), desc="calculating FID - saving reals"
+        ):
             real_batch = next(self.loader)
             for k in range(real_batch.size(0)):
-                torchvision.utils.save_image(real_batch[k, :, :, :], real_path + '{}.png'.format(k + batch_num * self.batch_size))
+                torchvision.utils.save_image(
+                    real_batch[k, :, :, :],
+                    real_path + "{}.png".format(k + batch_num * self.batch_size),
+                )
 
         # generate a bunch of fake images in results / name / fid_fake
         self.GAN.eval()
@@ -1127,7 +1295,9 @@ class Trainer():
         latent_dim = self.GAN.latent_dim
         image_size = self.GAN.image_size
 
-        for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
+        for batch_num in tqdm(
+            range(num_batches), desc="calculating FID - saving generated"
+        ):
             # latents and noise
             latents = torch.randn(self.batch_size, latent_dim).cuda(self.rank)
 
@@ -1135,17 +1305,27 @@ class Trainer():
             generated_images = self.generate_truncated(self.GAN.GE, latents)
 
             for j in range(generated_images.size(0)):
-                torchvision.utils.save_image(generated_images[j, :, :, :], str(Path(fake_path) / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
+                torchvision.utils.save_image(
+                    generated_images[j, :, :, :],
+                    str(
+                        Path(fake_path)
+                        / f"{str(j + batch_num * self.batch_size)}-ema.{ext}"
+                    ),
+                )
 
-        return fid_score.calculate_fid_given_paths([real_path, fake_path], 256, True, 2048)
+        return fid_score.calculate_fid_given_paths(
+            [real_path, fake_path], 256, True, 2048
+        )
 
     @torch.no_grad()
-    def generate_truncated(self, G, style, trunc_psi = 0.75, num_image_tiles = 8):
+    def generate_truncated(self, G, style, trunc_psi=0.75, num_image_tiles=8):
         generated_images = evaluate_in_chunks(self.batch_size, G, style)
-        return generated_images.clamp_(0., 1.)
+        return generated_images.clamp_(0.0, 1.0)
 
     @torch.no_grad()
-    def generate_interpolation(self, num = 0, num_image_tiles = 8, trunc = 1.0, num_steps = 100, save_frames = False):
+    def generate_interpolation(
+        self, num=0, num_image_tiles=8, trunc=1.0, num_steps=100, save_frames=False
+    ):
         self.GAN.eval()
         ext = self.image_extension
         num_rows = num_image_tiles
@@ -1158,44 +1338,51 @@ class Trainer():
         latents_low = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
         latents_high = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
 
-        ratios = torch.linspace(0., 8., num_steps)
+        ratios = torch.linspace(0.0, 8.0, num_steps)
 
         frames = []
         for ratio in tqdm(ratios):
             interp_latents = slerp(ratio, latents_low, latents_high)
             generated_images = self.generate_truncated(self.GAN.GE, interp_latents)
-            images_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
+            images_grid = torchvision.utils.make_grid(generated_images, nrow=num_rows)
             pil_image = transforms.ToPILImage()(images_grid.cpu())
-            
+
             if self.transparent:
-                background = Image.new('RGBA', pil_image.size, (255, 255, 255))
+                background = Image.new("RGBA", pil_image.size, (255, 255, 255))
                 pil_image = Image.alpha_composite(background, pil_image)
-                
+
             frames.append(pil_image)
 
-        frames[0].save(str(self.results_dir / self.name / f'{str(num)}.gif'), save_all=True, append_images=frames[1:], duration=80, loop=0, optimize=True)
+        frames[0].save(
+            str(self.results_dir / self.name / f"{str(num)}.gif"),
+            save_all=True,
+            append_images=frames[1:],
+            duration=80,
+            loop=0,
+            optimize=True,
+        )
 
         if save_frames:
-            folder_path = (self.results_dir / self.name / f'{str(num)}')
+            folder_path = self.results_dir / self.name / f"{str(num)}"
             folder_path.mkdir(parents=True, exist_ok=True)
             for ind, frame in enumerate(frames):
-                frame.save(str(folder_path / f'{str(ind)}.{ext}'))
+                frame.save(str(folder_path / f"{str(ind)}.{ext}"))
 
     def print_log(self):
         data = [
-            ('G', self.g_loss),
-            ('D', self.d_loss),
-            ('GP', self.last_gp_loss),
-            ('SS', self.last_recon_loss),
-            ('FID', self.last_fid)
+            ("G", self.g_loss),
+            ("D", self.d_loss),
+            ("GP", self.last_gp_loss),
+            ("SS", self.last_recon_loss),
+            ("FID", self.last_fid),
         ]
 
         data = [d for d in data if exists(d[1])]
-        log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
+        log = " | ".join(map(lambda n: f"{n[0]}: {n[1]:.2f}", data))
         print(log)
 
     def model_name(self, num):
-        return str(self.models_dir / self.name / f'model_{num}.pt')
+        return str(self.models_dir / self.name / f"model_{num}.pt")
 
     def init_folders(self):
         (self.results_dir / self.name).mkdir(parents=True, exist_ok=True)
@@ -1208,48 +1395,49 @@ class Trainer():
         self.init_folders()
 
     def save(self, num):
-        save_data = {
-            'GAN': self.GAN.state_dict(),
-            'version': __version__
-        }
+        save_data = {"GAN": self.GAN.state_dict(), "version": __version__}
 
         if self.amp:
             save_data = {
                 **save_data,
-                'G_scaler': self.G_scaler.state_dict(),
-                'D_scaler': self.D_scaler.state_dict()
+                "G_scaler": self.G_scaler.state_dict(),
+                "D_scaler": self.D_scaler.state_dict(),
             }
 
         torch.save(save_data, self.model_name(num))
         self.write_config()
 
-    def load(self, num = -1):
+    def load(self, num=-1):
         self.load_config()
 
         name = num
         if num == -1:
-            file_paths = [p for p in Path(self.models_dir / self.name).glob('model_*.pt')]
-            saved_nums = sorted(map(lambda x: int(x.stem.split('_')[1]), file_paths))
+            file_paths = [
+                p for p in Path(self.models_dir / self.name).glob("model_*.pt")
+            ]
+            saved_nums = sorted(map(lambda x: int(x.stem.split("_")[1]), file_paths))
             if len(saved_nums) == 0:
                 return
             name = saved_nums[-1]
-            print(f'continuing from previous epoch - {name}')
+            print(f"continuing from previous epoch - {name}")
 
         self.steps = name * self.save_every
 
         load_data = torch.load(self.model_name(name))
 
-        if 'version' in load_data and self.is_main:
+        if "version" in load_data and self.is_main:
             print(f"loading from version {load_data['version']}")
 
         try:
-            self.GAN.load_state_dict(load_data['GAN'])
+            self.GAN.load_state_dict(load_data["GAN"])
         except Exception as e:
-            print('unable to load save model. please try downgrading the package to the version specified by the saved model')
+            print(
+                "unable to load save model. please try downgrading the package to the version specified by the saved model"
+            )
             raise e
 
         if self.amp:
-            if 'G_scaler' in load_data:
-                self.G_scaler.load_state_dict(load_data['G_scaler'])
-            if 'D_scaler' in load_data:
-                self.D_scaler.load_state_dict(load_data['D_scaler'])
+            if "G_scaler" in load_data:
+                self.G_scaler.load_state_dict(load_data["G_scaler"])
+            if "D_scaler" in load_data:
+                self.D_scaler.load_state_dict(load_data["D_scaler"])
